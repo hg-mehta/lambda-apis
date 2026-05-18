@@ -1,0 +1,6 @@
+*.tfvars
+.env
+.terraform
+*.tfstate
+apis/published
+.vscode
