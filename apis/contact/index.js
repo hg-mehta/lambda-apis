@@ -9,6 +9,118 @@ const url = require('url');
 const MAX_MESSAGE_LENGTH = 2000;
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
+// Slack allows at most 10 fields per section block
+const MAX_METADATA_ENTRIES = 10;
+const MAX_METADATA_KEY_LENGTH = 50;
+const MAX_METADATA_VALUE_LENGTH = 200;
+
+/**
+ * Escape characters that Slack mrkdwn treats as control characters
+ */
+function escapeSlack(text) {
+  return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function truncate(text, max) {
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+}
+
+function isPlainObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+/**
+ * Turn free-form metadata into Slack mrkdwn fields.
+ * Null/undefined values are skipped; objects/arrays are JSON-stringified.
+ */
+function buildMetadataFields(metadata) {
+  const entries = Object.entries(metadata).filter(([, v]) => v !== null && v !== undefined);
+
+  if (entries.length > MAX_METADATA_ENTRIES) {
+    console.warn(`Metadata has ${entries.length} entries; only the first ${MAX_METADATA_ENTRIES} are sent to Slack`);
+  }
+
+  return entries.slice(0, MAX_METADATA_ENTRIES).map(([key, value]) => {
+    const rendered = typeof value === 'object' ? JSON.stringify(value) : String(value);
+    return {
+      type: 'mrkdwn',
+      text: `*${escapeSlack(truncate(key, MAX_METADATA_KEY_LENGTH))}:*\n${escapeSlack(truncate(rendered, MAX_METADATA_VALUE_LENGTH))}`
+    };
+  });
+}
+
+/**
+ * Build Slack Block Kit blocks. Optional fields (phone, website, metadata)
+ * are only rendered when present, so legacy payloads produce the same blocks as before.
+ */
+function buildSlackBlocks(message) {
+  const fields = [
+    {
+      type: 'mrkdwn',
+      text: `*Name:*\n${message.name}`
+    },
+    {
+      type: 'mrkdwn',
+      text: `*Email:*\n<mailto:${message.email}|${message.email}>`
+    },
+    {
+      type: 'mrkdwn',
+      text: `*Company:*\n${message.company || 'N/A'}`
+    },
+    {
+      type: 'mrkdwn',
+      text: `*Service Interest:*\n${message.service || 'N/A'}`
+    }
+  ];
+
+  if (message.phone) {
+    fields.push({ type: 'mrkdwn', text: `*Phone:*\n${escapeSlack(message.phone)}` });
+  }
+
+  if (message.website) {
+    fields.push({ type: 'mrkdwn', text: `*Website:*\n${escapeSlack(message.website)}` });
+  }
+
+  const blocks = [
+    {
+      type: 'header',
+      text: {
+        type: 'plain_text',
+        text: '📧 New Contact Form Submission',
+        emoji: true
+      }
+    },
+    {
+      type: 'section',
+      fields
+    },
+    {
+      type: 'section',
+      text: {
+        type: 'mrkdwn',
+        text: `*Message:*\n${message.message}`
+      }
+    }
+  ];
+
+  const metadataFields = message.metadata ? buildMetadataFields(message.metadata) : [];
+  if (metadataFields.length > 0) {
+    blocks.push({ type: 'section', fields: metadataFields });
+  }
+
+  blocks.push({
+    type: 'context',
+    elements: [
+      {
+        type: 'mrkdwn',
+        text: `⏰ ${new Date().toISOString()}`
+      }
+    ]
+  });
+
+  return blocks;
+}
+
 /**
  * Send message to Slack webhook
  */
@@ -19,53 +131,7 @@ function sendToSlack(webhookUrl, message) {
     // Format message with Slack Block Kit for better presentation
     const payload = JSON.stringify({
       text: 'New Contact Form Submission',
-      blocks: [
-        {
-          type: 'header',
-          text: {
-            type: 'plain_text',
-            text: '📧 New Contact Form Submission',
-            emoji: true
-          }
-        },
-        {
-          type: 'section',
-          fields: [
-            {
-              type: 'mrkdwn',
-              text: `*Name:*\n${message.name}`
-            },
-            {
-              type: 'mrkdwn',
-              text: `*Email:*\n<mailto:${message.email}|${message.email}>`
-            },
-            {
-              type: 'mrkdwn',
-              text: `*Company:*\n${message.company || 'N/A'}`
-            },
-            {
-              type: 'mrkdwn',
-              text: `*Service Interest:*\n${message.service || 'N/A'}`
-            }
-          ]
-        },
-        {
-          type: 'section',
-          text: {
-            type: 'mrkdwn',
-            text: `*Message:*\n${message.message}`
-          }
-        },
-        {
-          type: 'context',
-          elements: [
-            {
-              type: 'mrkdwn',
-              text: `⏰ ${new Date().toISOString()}`
-            }
-          ]
-        }
-      ]
+      blocks: buildSlackBlocks(message)
     });
 
     const options = {
@@ -123,6 +189,17 @@ function validateInput(data) {
 
   if (data.message && data.message.length > MAX_MESSAGE_LENGTH) {
     errors.push(`Message must be less than ${MAX_MESSAGE_LENGTH} characters`);
+  }
+
+  // Optional fields: absent (or null) is fine, but if provided they must be well-formed
+  ['phone', 'website'].forEach((field) => {
+    if (data[field] !== undefined && data[field] !== null && typeof data[field] !== 'string') {
+      errors.push(`${field} must be a string`);
+    }
+  });
+
+  if (data.metadata !== undefined && data.metadata !== null && !isPlainObject(data.metadata)) {
+    errors.push('metadata must be an object');
   }
 
   return errors;
@@ -201,6 +278,17 @@ exports.handler = async (event) => {
       service: body.service ? body.service.trim() : '',
       message: body.message.trim()
     };
+
+    // Optional fields, only attached when provided
+    if (body.phone && body.phone.trim()) {
+      slackMessage.phone = body.phone.trim();
+    }
+    if (body.website && body.website.trim()) {
+      slackMessage.website = body.website.trim();
+    }
+    if (body.metadata) {
+      slackMessage.metadata = body.metadata;
+    }
 
     // Send to Slack
     try {
